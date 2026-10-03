@@ -1,0 +1,13 @@
+{
+  "name": "claude-image-viewer",
+  "owner": {
+    "name": "claude-image-viewer maintainers"
+  },
+  "plugins": [
+    {
+      "name": "image-preview",
+      "source": "./",
+      "description": "Shows a thumbnail of each image you paste into Claude Code, instead of only [Image #1]."
+    }
+  ]
+}
