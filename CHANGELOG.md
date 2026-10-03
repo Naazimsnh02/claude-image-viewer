@@ -6,4 +6,5 @@
 - The thumbnail stays under the message in the transcript once it is sent.
 - `/image-preview` to hide or show previews, and `/image-preview <n>` to open one larger in a pane.
 - Quadrant-block renderer (four pixels a cell) for every terminal; kitty graphics renderer for kitty and Ghostty.
+- Reads each pasted image from Claude Code's per-session image cache, so several images pasted together each get a preview; the clipboard is only a fallback.
 - Options for thumbnail size, transcript previews and the renderer.

@@ -14,6 +14,9 @@ const POLL_MS = 750
 /** The longest side, in pixels, of what the scripts hand back. */
 const BLOCKS_MAX_PIXELS = 384
 const PICTURE_MAX_PIXELS = 512
+/** How long a paste is given to reach Claude Code's image cache. */
+const CACHE_TRIES = 5
+const CACHE_WAIT_MS = 150
 /** Previews kept for the transcript and the pane; the oldest go first. */
 const KEPT = 40
 
@@ -54,6 +57,10 @@ type Session = {
   /** The image the pane shows. */
   shown: number | undefined
   host: Promise<Host> | undefined
+  /** The folders Claude Code may keep its temporary files in. */
+  roots: Promise<string[]> | undefined
+  /** The folder holding this session's pasted images, once found. */
+  cache: { sessionId: string; directory: string } | undefined
 }
 
 function hostOf($: EngineInterface, session: Session): Promise<Host> {
@@ -77,6 +84,84 @@ function hostOf($: EngineInterface, session: Session): Promise<Host> {
   return session.host
 }
 
+function rootsOf($: EngineInterface, session: Session, isWindows: boolean): Promise<string[]> {
+  session.roots ??= (async () => {
+    const override = await $.env.get('CLAUDE_CODE_TMPDIR')
+    const roots = override === undefined ? [] : [override]
+
+    if (isWindows) {
+      const temp = await $.env.get('TEMP')
+      for (const base of [override, temp]) {
+        if (base !== undefined) roots.push(`${base}\\claude`)
+      }
+    } else {
+      const uid = await $.process.run(['id', '-u']).then(
+        result => result.stdout.trim(),
+        () => '',
+      )
+      if (uid !== '') {
+        if (override !== undefined) roots.push(`${override}/claude-${uid}`)
+        roots.push(`/tmp/claude-${uid}`)
+      }
+    }
+
+    return roots
+  })()
+
+  return session.roots
+}
+
+/**
+ * The file Claude Code cached a pasted image as:
+ * `<tmp>/<project>/<session>/images/<n>.png`. The project folder's name is
+ * Claude Code's to choose, so the session's folder is looked for in each.
+ */
+async function cachedImage(
+  $: EngineInterface,
+  session: Session,
+  id: number,
+  isWindows: boolean,
+): Promise<string | undefined> {
+  const roots = await rootsOf($, session, isWindows)
+  if (roots.length === 0) {
+    return undefined
+  }
+
+  const slash = isWindows ? '\\' : '/'
+  const sessionId = await $.session.id()
+
+  for (let attempt = 0; attempt < CACHE_TRIES; attempt++) {
+    if (attempt > 0) {
+      await $.clock.sleep(CACHE_WAIT_MS)
+    }
+
+    if (session.cache?.sessionId !== sessionId) {
+      session.cache = undefined
+      for (const root of roots) {
+        const projects = await $.fs.list(root).catch(() => [])
+        for (const project of projects) {
+          const directory = [root, project.name, sessionId, 'images'].join(slash)
+          if (project.kind === 'dir' && (await $.fs.exists(directory).catch(() => false))) {
+            session.cache = { sessionId, directory }
+            break
+          }
+        }
+        if (session.cache !== undefined) break
+      }
+    }
+    if (session.cache === undefined) continue
+
+    const { directory } = session.cache
+    const files = await $.fs.list(directory).catch(() => [])
+    const file = files.find(one => one.kind === 'file' && one.name.replace(/\.[^.]+$/, '') === String(id))
+    if (file !== undefined) {
+      return `${directory}${slash}${file.name}`
+    }
+  }
+
+  return undefined
+}
+
 function keep(session: Session, preview: Preview): void {
   const { previews } = session
   previews.delete(preview.id)
@@ -87,16 +172,24 @@ function keep(session: Session, preview: Preview): void {
   }
 }
 
-/** Asks the host for a thumbnail of the clipboard's image, or of `path`. */
+/**
+ * Asks the host for a thumbnail of image `id`: of the file Claude Code cached
+ * it as, else of `fallback.path`, else of the clipboard's image.
+ */
 async function capture(
   $: EngineInterface,
   session: Session,
   id: number,
-  path: string | undefined,
+  fallback: { path?: string; canUseClipboard: boolean },
 ): Promise<void> {
   let preview: Preview
   try {
     const { isWindows, drawsPictures } = await hostOf($, session)
+    const cached = await cachedImage($, session, id, isWindows).catch(() => undefined)
+    const path = cached ?? fallback.path
+    if (path === undefined && !fallback.canUseClipboard) {
+      throw new Error('pasted with others, and not in the image cache')
+    }
     const format = drawsPictures ? 'png' : 'bmp'
     const max = String(drawsPictures ? PICTURE_MAX_PIXELS : BLOCKS_MAX_PIXELS)
     const argv = isWindows
@@ -140,7 +233,7 @@ async function capture(
 
 /**
  * Takes the draft as it now stands: an `[Image #N]` with a number never seen
- * before is a fresh paste, and its pixels are still on the clipboard.
+ * before is a fresh paste.
  */
 function sync($: EngineInterface, session: Session, text: string, path?: string): void {
   const ids = idsIn(text)
@@ -152,14 +245,10 @@ function sync($: EngineInterface, session: Session, text: string, path?: string)
   if (newest !== undefined) {
     session.highest = newest
     for (const id of fresh) {
+      keep(session, { id, status: 'loading' })
       // One clipboard holds one image: of several at once, the last is it.
-      const isCaptured = id === newest
-      keep(
-        session,
-        isCaptured ? { id, status: 'loading' } : { id, status: 'missing', reason: 'pasted with others' },
-      )
+      void capture($, session, id, id === newest ? { path, canUseClipboard: true } : { canUseClipboard: false })
     }
-    void capture($, session, newest, path)
   }
 
   if (isChanged) {
@@ -270,6 +359,8 @@ export const register: Register = (on, options) => {
     isHidden: false,
     shown: undefined,
     host: undefined,
+    roots: undefined,
+    cache: undefined,
   }
 
   on('session.start', async ($, e, next) => {

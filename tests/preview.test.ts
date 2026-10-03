@@ -18,9 +18,9 @@ const MESSAGE = {
 } as const
 
 /** Stands for the host: a clipboard holding one image, or none. */
-function host(on: On, stdout: string): { argv: string[][] } {
+function host(on: On, stdout: string, env: Record<string, string> = {}): { argv: string[][] } {
   const seen = { argv: [] as string[][] }
-  mock.env(on, { OS: 'Windows_NT' })
+  mock.env(on, { OS: 'Windows_NT', ...env })
   on('process.run', (_$, e) => {
     seen.argv.push([...e.argv])
 
@@ -89,4 +89,55 @@ test('the command hides the previews and shows them again', async ($, on) => {
 
   const unknown = await $.command.run({ command: PLUGIN, args: '7', ...TYPED })
   expect(unknown.text).toBe('No preview for that image. Have: #1.')
+})
+
+test('images pasted together are each read from the image cache', async ($, on) => {
+  const seen = host(on, `OK bmp 4 4 ${RED_AND_BLUE}\n`, { TEMP: 'C:\\Temp' })
+  const images = 'C:\\Temp\\claude\\C--work\\sess-1\\images'
+  const entry = { size: 0, mtimeMs: 0, isLink: false }
+  on('session.id', () => ({ value: 'sess-1' }))
+  on('fs.exists', (_$, e) => ({ value: e.path === images }))
+  on('fs.list', (_$, e) => ({
+    value:
+      e.path === images
+        ? [
+            { name: '1.png', kind: 'file', ...entry },
+            { name: '2.png', kind: 'file', ...entry },
+          ]
+        : [{ name: 'C--work', kind: 'dir', ...entry }],
+  }))
+
+  await $.prompt.submit({ text: '[Image #1] [Image #2]', origin: COMPOSER, wait: false })
+  const ui = await $.ui.mount({ ...MESSAGE, props: { ...MESSAGE.props, text: '[Image #1] [Image #2]' } })
+
+  expect(await ui.find({ type: 'Raster', key: 'image-1' })).toBeDefined()
+  expect(await ui.find({ type: 'Raster', key: 'image-2' })).toBeDefined()
+  expect(seen.argv.map(argv => argv.at(-1)).sort()).toEqual([`${images}\\1.png`, `${images}\\2.png`])
+  await ui.unmount()
+})
+
+test('a terminal with the kitty graphics protocol is handed the picture itself', async ($, on) => {
+  const png =
+    'iVBORw0KGgoAAAANSUhEUgAAAEAAAAArCAYAAADIWo5HAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQ='
+  const seen = { argv: [] as string[][] }
+  mock.env(on, { TERM: 'xterm-kitty' })
+  on('process.run', (_$, e) => {
+    seen.argv.push([...e.argv])
+    const stdout = e.argv[0] === 'id' ? '' : `OK png 1920 1290 ${png}\n`
+
+    return {
+      value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
+    }
+  })
+  on('prompt.submit', (_$, e) => ({ text: e.text }))
+  on('ui.render', () => ({ type: 'engine', ref: 0 }))
+
+  await $.prompt.submit({ text: 'what is this? [Image #1]', origin: COMPOSER, wait: false })
+  const ui = await $.ui.mount(MESSAGE)
+
+  const image = await ui.find({ type: 'Image', key: 'image-1' })
+  expect(image?.props).toMatchObject({ source: { png }, alt: 'Image #1 1920×1290' })
+  expect(await ui.find({ type: 'Raster' })).toBeUndefined()
+  expect(seen.argv.find(argv => argv[0] === 'sh')?.slice(2, 4)).toEqual(['512', 'png'])
+  await ui.unmount()
 })

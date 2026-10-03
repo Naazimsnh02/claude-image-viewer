@@ -31,8 +31,8 @@ Image #1 1920×1080      Image #2 800×800
 | Platform | Needs | Status |
 | :-- | :-- | :-- |
 | Windows | Windows PowerShell 5.1 (ships with Windows) | Tested |
-| macOS | `osascript` and `sips` (ship with macOS) | Implemented, not yet tested |
-| Linux | `wl-clipboard` or `xclip`, and ImageMagick | Implemented, not yet tested |
+| macOS | `sips` (ships with macOS) | Implemented, not yet tested |
+| Linux | ImageMagick | Implemented, not yet tested |
 
 ## Install
 
@@ -75,19 +75,17 @@ Set these from `/plugin` → **Installed** → `image-preview`, or under `plugin
 
 ## How it works
 
-Claude Code hands a mod the text of the prompt, where a pasted image is only the placeholder `[Image #N]`; the image's bytes are not part of that. So the mod reads them from the same place Claude Code did:
+Claude Code hands a mod the text of the prompt, where a pasted image is only the placeholder `[Image #N]`; the image's bytes are not part of that. So the mod reads them from where Claude Code put them:
 
 1. A `prompt.edit` hook (and a slow poll of the draft, as a safety net) notices a new `[Image #N]`.
-2. A small script in [`scripts/`](scripts) reads the image still on the clipboard, shrinks it to at most 384 pixels a side, and prints it as base64 on standard output. Nothing is written to disk on Windows; macOS and Linux use a temporary directory that is removed at once.
+2. Claude Code caches each pasted image for the session as `<tmp>/<project>/<session>/images/<N>.png`. A small script in [`scripts/`](scripts) reads that file, shrinks it to at most 384 pixels a side, and prints it as base64 on standard output. Nothing is written to disk on Windows; macOS and Linux use a temporary directory that is removed at once.
 3. The mod decodes the thumbnail and packs it into a `Raster` of quadrant-block cells (`▚`, `▌`, `▀` and the rest), four pixels a cell in the two colors that fit them best, drawn by `ui.render` hooks above the prompt and under the sent message.
 
-If you drag a file onto the terminal instead of pasting pixels, the mod reads that file.
+If the cached file cannot be found, the mod falls back to the file you dragged onto the terminal, or to the image still on the clipboard (which on Linux needs `wl-clipboard` or `xclip`).
 
 ## Limitations
 
 - **A preview is taken at paste time.** Images in a resumed session, or pasted before the mod loaded, have no preview.
-- **The clipboard must still hold the image** a moment after you paste. If you copy something else within that second, the preview shows `(no preview)`, or the newer image.
-- **Several images arriving in one edit** get one preview: the clipboard holds one image.
 - **The terminal and nowhere else.** The Desktop app's Code tab, the VS Code panel and Remote Control draw nothing; the mod stays out of their way.
 - **Blocks are coarse**: a cell holds four pixels in two colors, so a 10-row thumbnail is about 96×20 pixels and small text in a screenshot is not readable. Raise `rows` and `maxColumns`, or open the image in the pane. Real pixels need the kitty graphics protocol, which Windows Terminal does not have.
 - WebP files dragged onto a Windows terminal are not previewed (GDI+ does not read them).
@@ -99,12 +97,12 @@ A mod runs with your permissions. This one asks Claude Code for the following, w
 ```text
 hooks: session.start, session.end, prompt.edit, prompt.submit, command.run{command=image-preview},
        ui.render{component=AbovePrompt}, ui.render{component=UserMessage}, ui.render{component=Pane}
-calls: $.clock.every, $.command.register, $.env.get, $.process.run, $.prompt.read,
-       $.ui.invalidate, $.ui.log, $.ui.open, $.ui.resolve
-env reads: KITTY_WINDOW_ID, OS, TERM, TERM_PROGRAM
+calls: $.clock.every, $.clock.sleep, $.command.register, $.env.get, $.fs.exists, $.fs.list,
+       $.process.run, $.prompt.read, $.session.id, $.ui.invalidate, $.ui.log, $.ui.open, $.ui.resolve
+env reads: CLAUDE_CODE_TMPDIR, KITTY_WINDOW_ID, OS, TEMP, TERM, TERM_PROGRAM
 ```
 
-`$.process.run` starts only the two scripts in `scripts/`. The mod reads your draft to find `[Image #N]`; it never changes a prompt, makes no network request and stores nothing.
+`$.process.run` starts only the two scripts in `scripts/`, and `id -u` once on macOS and Linux to find Claude Code's temporary folder. `$.fs` only lists that folder to find the session's image cache. The mod reads your draft to find `[Image #N]`; it never changes a prompt, makes no network request and stores nothing.
 
 ## Develop
 
